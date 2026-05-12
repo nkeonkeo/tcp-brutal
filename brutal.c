@@ -37,6 +37,9 @@
 #define MIN_PKT_INFO_SAMPLES 50
 #define MIN_ACK_RATE_PERCENT 80
 
+/* Loss % above which pacing is scaled down (0 = feature off). Tunable via sysctl. */
+#define DEFAULT_LOSS_SLOW_THRESH 30
+
 #define TCP_BRUTAL_PARAMS 23301
 
 /*
@@ -45,10 +48,13 @@
  * net.ipv4.tcp_brutal_default_rate (writable; min = MIN_PACING_RATE).
  */
 static unsigned long brutal_default_rate = INIT_PACING_RATE;
+static unsigned long brutal_loss_slow_thresh = DEFAULT_LOSS_SLOW_THRESH;
 
 #if IS_ENABLED(CONFIG_SYSCTL)
 static unsigned long brutal_default_rate_min = MIN_PACING_RATE;
 static unsigned long brutal_default_rate_max = (~0UL) / 200;
+static unsigned long brutal_loss_slow_thresh_min = 0;
+static unsigned long brutal_loss_slow_thresh_max = 100;
 
 static struct ctl_table brutal_sysctl_table[] = {
 	{
@@ -59,6 +65,15 @@ static struct ctl_table brutal_sysctl_table[] = {
 		.proc_handler = proc_doulongvec_minmax,
 		.extra1 = &brutal_default_rate_min,
 		.extra2 = &brutal_default_rate_max,
+	},
+	{
+		.procname = "tcp_brutal_loss_slow_thresh",
+		.data = &brutal_loss_slow_thresh,
+		.maxlen = sizeof(brutal_loss_slow_thresh),
+		.mode = 0644,
+		.proc_handler = proc_doulongvec_minmax,
+		.extra1 = &brutal_loss_slow_thresh_min,
+		.extra2 = &brutal_loss_slow_thresh_max,
 	},
 	{ }
 };
@@ -226,6 +241,8 @@ static void brutal_update_rate(struct sock *sk)
     u64 sec = tcp_sock_get_sec(tp);
     u64 min_sec = sec - PKT_INFO_SLOTS;
     u32 acked = 0, losses = 0;
+    u32 total;
+    u32 loss_pct = 0;
     u32 ack_rate; // Scaled by 100 (100=1.00) as kernel doesn't support float
     u64 rate = brutal->rate;
     u32 cwnd;
@@ -243,17 +260,39 @@ static void brutal_update_rate(struct sock *sk)
             losses += brutal->slots[i].losses;
         }
     }
-    if (acked + losses < MIN_PKT_INFO_SAMPLES)
+    total = acked + losses;
+    if (total < MIN_PKT_INFO_SAMPLES)
         ack_rate = 100;
     else
     {
-        ack_rate = acked * 100 / (acked + losses);
+        ack_rate = acked * 100 / total;
         if (ack_rate < MIN_ACK_RATE_PERCENT)
             ack_rate = MIN_ACK_RATE_PERCENT;
+        loss_pct = losses * 100 / total;
     }
 
     rate *= 100;
     rate = div_u64(rate, ack_rate);
+
+    /* When loss exceeds threshold, scale pacing/cwnd down (linear in loss above thresh). */
+    {
+        unsigned long thresh = READ_ONCE(brutal_loss_slow_thresh);
+
+        if (thresh > 0 && thresh < 100 && total >= MIN_PKT_INFO_SAMPLES && loss_pct > thresh)
+        {
+            u32 excess = loss_pct - (u32)thresh;
+            u32 room = 100U - (u32)thresh;
+
+            if (room)
+            {
+                u32 loss_scale = 100U - (excess * 60U) / room;
+
+                if (loss_scale < 15U)
+                    loss_scale = 15U;
+                rate = mul_u64_u32_div(rate, loss_scale, 100U);
+            }
+        }
+    }
 
     // The order here is chosen carefully to avoid overflow as much as possible
     cwnd = div_u64(rate, MSEC_PER_SEC);
@@ -377,4 +416,4 @@ module_exit(brutal_unregister);
 MODULE_AUTHOR("Aperture Internet Laboratory");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("TCP Brutal");
-MODULE_VERSION("1.0.3");
+MODULE_VERSION("1.0.4");

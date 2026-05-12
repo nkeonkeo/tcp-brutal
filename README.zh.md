@@ -65,6 +65,8 @@ python client.py -p 1234 example.com 50
 
 在启用 `CONFIG_SYSCTL` 的内核上，加载本模块后会多出 **`net.ipv4.tcp_brutal_default_rate`**（单位：**字节/秒**），用于调整「尚未设置 `TCP_BRUTAL_PARAMS`」时的初始目标速率；可写，下限与 sockopt 一致（62500，即 500 Kbps）。已设置 sockopt 的连接不受影响。支持 Brutal 的应用仍应主动切换拥塞算法并设置参数。
 
+另有 **`net.ipv4.tcp_brutal_loss_slow_thresh`**（**0–100**，丢包率百分比）：在最近时间窗内统计的 ACK/丢包样本足够时，若丢包率 **高于** 该阈值，则对用于 pacing 与 cwnd 的有效速率按比例下调（丢包越严重降得越多，最低约保留 15%）；**0** 或 **100** 均表示关闭该降速逻辑。默认 **30**。未启用 `CONFIG_SYSCTL` 时该阈值在模块内固定为 30。
+
 ## 开发者指南
 
 该内核模块向系统添加了一个新的 "brutal" TCP 拥塞控制算法，程序可以使用 TCP_CONGESTION sockopt 来启用。

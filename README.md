@@ -67,6 +67,8 @@ Usually you don't need to. Unlike BBR, TCP Brutal only has well-defined behavior
 
 On kernels built with `CONFIG_SYSCTL`, loading this module registers **`net.ipv4.tcp_brutal_default_rate`** (unit: **bytes per second**). It controls that initial target rate before `TCP_BRUTAL_PARAMS` is set; it is writable with the same minimum as the sockopt (62500, i.e. 500 Kbps). Connections that already set the sockopt are unaffected. Applications with Brutal support should still select the congestion algorithm and set parameters explicitly.
 
+It also registers **`net.ipv4.tcp_brutal_loss_slow_thresh`** (**0–100**, loss percentage). When there are enough ACK/loss samples in the recent window, if the loss rate **exceeds** this threshold the effective rate used for pacing and cwnd is scaled down (more loss means a lower cap, down to about 15% of the pre-penalty value). **0** or **100** disables this logic. The default is **30**. Without `CONFIG_SYSCTL`, the threshold is fixed at 30 in the module.
+
 ## For developers
 
 This kernel module adds a new "brutal" TCP congestion control algorithm to the system, which programs can enable using TCP_CONGESTION sockopt.
