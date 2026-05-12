@@ -3,6 +3,11 @@
 #include <net/tcp.h>
 #include <linux/math64.h>
 
+#if IS_ENABLED(CONFIG_SYSCTL)
+#include <linux/sysctl.h>
+#include <net/net_namespace.h>
+#endif
+
 #if IS_ENABLED(CONFIG_IPV6) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 #include <net/transp_v6.h>
 #else
@@ -33,6 +38,33 @@
 #define MIN_ACK_RATE_PERCENT 80
 
 #define TCP_BRUTAL_PARAMS 23301
+
+/*
+ * Initial target send rate (bytes/s) before the application sets
+ * TCP_BRUTAL_PARAMS. When CONFIG_SYSCTL is enabled, this is exposed as
+ * net.ipv4.tcp_brutal_default_rate (writable; min = MIN_PACING_RATE).
+ */
+static unsigned long brutal_default_rate = INIT_PACING_RATE;
+
+#if IS_ENABLED(CONFIG_SYSCTL)
+static unsigned long brutal_default_rate_min = MIN_PACING_RATE;
+static unsigned long brutal_default_rate_max = (~0UL) / 200;
+
+static struct ctl_table brutal_sysctl_table[] = {
+	{
+		.procname = "tcp_brutal_default_rate",
+		.data = &brutal_default_rate,
+		.maxlen = sizeof(brutal_default_rate),
+		.mode = 0644,
+		.proc_handler = proc_doulongvec_minmax,
+		.extra1 = &brutal_default_rate_min,
+		.extra2 = &brutal_default_rate_max,
+	},
+	{ }
+};
+
+static struct ctl_table_header *brutal_sysctl_header;
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
 static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
@@ -153,7 +185,13 @@ static void brutal_init(struct sock *sk)
 
     tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
-    brutal->rate = INIT_PACING_RATE;
+    {
+        u64 rate = READ_ONCE(brutal_default_rate);
+
+        if (rate < MIN_PACING_RATE)
+            rate = MIN_PACING_RATE;
+        brutal->rate = rate;
+    }
     brutal->cwnd_gain = INIT_CWND_GAIN;
 
     memset(brutal->slots, 0, sizeof(brutal->slots));
@@ -288,8 +326,19 @@ static struct tcp_congestion_ops tcp_brutal_ops = {
 
 static int __init brutal_register(void)
 {
+    int err;
+
     BUILD_BUG_ON(sizeof(struct brutal) > ICSK_CA_PRIV_SIZE);
     BUILD_BUG_ON(PKT_INFO_SLOTS < 1);
+
+#if IS_ENABLED(CONFIG_SYSCTL)
+    brutal_sysctl_header = register_net_sysctl(&init_net, "net/ipv4", brutal_sysctl_table);
+    if (IS_ERR(brutal_sysctl_header)) {
+        err = PTR_ERR(brutal_sysctl_header);
+        brutal_sysctl_header = NULL;
+        return err;
+    }
+#endif
 
     tcp_prot_override = tcp_prot;
     tcp_prot_override.setsockopt = brutal_tcp_setsockopt;
@@ -299,12 +348,27 @@ static int __init brutal_register(void)
     tcpv6_prot_override.setsockopt = brutal_tcpv6_setsockopt;
 #endif // _TRANSP_V6_H
 
-    return tcp_register_congestion_control(&tcp_brutal_ops);
+    err = tcp_register_congestion_control(&tcp_brutal_ops);
+    if (err) {
+#if IS_ENABLED(CONFIG_SYSCTL)
+        if (brutal_sysctl_header) {
+            unregister_net_sysctl_table(brutal_sysctl_header);
+            brutal_sysctl_header = NULL;
+        }
+#endif
+    }
+    return err;
 }
 
 static void __exit brutal_unregister(void)
 {
     tcp_unregister_congestion_control(&tcp_brutal_ops);
+#if IS_ENABLED(CONFIG_SYSCTL)
+    if (brutal_sysctl_header) {
+        unregister_net_sysctl_table(brutal_sysctl_header);
+        brutal_sysctl_header = NULL;
+    }
+#endif
 }
 
 module_init(brutal_register);
@@ -313,4 +377,4 @@ module_exit(brutal_unregister);
 MODULE_AUTHOR("Aperture Internet Laboratory");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("TCP Brutal");
-MODULE_VERSION("1.0.2");
+MODULE_VERSION("1.0.3");
