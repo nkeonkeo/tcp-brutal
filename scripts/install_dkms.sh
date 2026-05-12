@@ -23,10 +23,7 @@ SCRIPT_INITIATOR_URL="https://tcp.hy2.sh"
 SCRIPT_INITIATOR_COMMAND="bash <(curl -fsSL $SCRIPT_INITIATOR_URL)"
 
 # URL of GitHub
-REPO_URL="https://github.com/apernet/tcp-brutal"
-
-# URL of Hysteria 2 API
-HY2_API_BASE_URL="https://api.hy2.io/v1"
+REPO_URL="https://github.com/nkeonkeo/tcp-brutal"
 
 # curl command line flags.
 # To using a proxy, please specify ALL_PROXY in the environ variable, such like:
@@ -661,27 +658,51 @@ kmod_unsetup_autoload() {
 # API
 ###
 
+# Print "owner/repo" for https://github.com/<owner>/<repo>(.git|/)
+github_owner_repo_from_url() {
+  local _u="${REPO_URL%.git}"
+  _u="${_u%/}"
+  if [[ "$_u" =~ github\.com/([^/]+)/([^/]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
 get_latest_version() {
   if [[ -n "$VERSION" ]]; then
     echo "$VERSION"
     return
   fi
 
-  local _tmpfile=$(mktemp)
-  if ! curl -sS "$HY2_API_BASE_URL/update?cver=installscript&arch=generic&plat=linux&chan=tcp-brutal" -o "$_tmpfile"; then
-    error "Failed to get the latest version from Hysteria 2 API, please check your network and try again."
+  local _repo_path
+  if ! _repo_path="$(github_owner_repo_from_url)"; then
+    error "REPO_URL is not a supported GitHub repository URL: $REPO_URL"
     exit 11
   fi
 
-  local _latest_version=$(grep -oP '"lver":\s*\K"v.*?"' "$_tmpfile" | head -1)
-  _latest_version=${_latest_version#'"'}
-  _latest_version=${_latest_version%'"'}
-
-  if [[ -n "$_latest_version" ]]; then
-    echo "$_latest_version"
+  local _tmpfile
+  _tmpfile=$(mktemp)
+  local _api="https://api.github.com/repos/${_repo_path}/releases/latest"
+  if ! curl -sS "$_api" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'User-Agent: tcp-brutal-install-dkms-script' \
+      -o "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    error "Failed to fetch the latest release from GitHub (${_api}), please check your network and try again."
+    exit 11
   fi
 
+  local _latest_version
+  _latest_version=$(grep -oP '"tag_name"\s*:\s*"\K[^"]+' "$_tmpfile" | head -1)
   rm -f "$_tmpfile"
+
+  if [[ -z "$_latest_version" ]]; then
+    error "Failed to parse tag_name from GitHub API response (no releases or unexpected JSON)."
+    exit 11
+  fi
+
+  echo "$_latest_version"
 }
 
 download_dkms_tarball() {
