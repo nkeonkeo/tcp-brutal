@@ -1,5 +1,6 @@
 #include <linux/module.h>
 #include <linux/version.h>
+#include <linux/jiffies.h>
 #include <net/tcp.h>
 #include <linux/math64.h>
 
@@ -16,7 +17,11 @@
  and your kernel version is greater than 5.8.
 #endif
 
-#define INIT_PACING_RATE 125000 // 1 Mbps
+/* Default bytes/s for tcp_brutal_default_rate when sysctl is never tuned (125e6 B/s ≈ 1 Gbps wire). */
+#define DEFAULT_BRUTAL_PACING_RATE 125000000
+/* Bytes/s: start each flow here, then double each RTT up to tcp_brutal_default_rate while loss is low. */
+#define START_RAMP_PACING_RATE 125000
+#define BRUTAL_RAMP_DISABLED (~0ULL)
 #define INIT_CWND_GAIN 20
 
 #define MIN_PACING_RATE 62500 // 500 Kbps
@@ -43,11 +48,13 @@
 #define TCP_BRUTAL_PARAMS 23301
 
 /*
- * Initial target send rate (bytes/s) before the application sets
- * TCP_BRUTAL_PARAMS. When CONFIG_SYSCTL is enabled, this is exposed as
- * net.ipv4.tcp_brutal_default_rate (writable; min = MIN_PACING_RATE).
+ * Ceiling for ramping base send rate (bytes/s) before the application sets
+ * TCP_BRUTAL_PARAMS. Each flow starts at START_RAMP_PACING_RATE (~1 Mbps),
+ * doubles each smoothed RTT until this value, unless loss exceeds
+ * tcp_brutal_loss_slow_thresh (then ramp pauses). When CONFIG_SYSCTL is on,
+ * exposed as net.ipv4.tcp_brutal_default_rate (writable; min = MIN_PACING_RATE).
  */
-static unsigned long brutal_default_rate = INIT_PACING_RATE;
+static unsigned long brutal_default_rate = DEFAULT_BRUTAL_PACING_RATE;
 static unsigned long brutal_loss_slow_thresh = DEFAULT_LOSS_SLOW_THRESH;
 
 #if IS_ENABLED(CONFIG_SYSCTL)
@@ -93,12 +100,22 @@ static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
     return div_u64(tp->tcp_mstamp.stamp_us, USEC_PER_SEC);
 }
 #else
-#include <linux/jiffies.h>
 static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
 {
     return div_u64(jiffies_to_usecs(tcp_time_stamp), USEC_PER_SEC);
 }
 #endif
+
+static u64 brutal_tcp_stamp_us(const struct tcp_sock *tp)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+    return tp->tcp_mstamp;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+    return tp->tcp_mstamp.stamp_us;
+#else
+    return jiffies_to_usecs(tcp_time_stamp);
+#endif
+}
 
 struct brutal_pkt_info
 {
@@ -110,6 +127,7 @@ struct brutal_pkt_info
 struct brutal
 {
     u64 rate;
+    u64 last_ramp_us; /* 0: not armed; BRUTAL_RAMP_DISABLED: TCP_BRUTAL_PARAMS set */
     u32 cwnd_gain;
 
     struct brutal_pkt_info slots[PKT_INFO_SLOTS];
@@ -154,6 +172,7 @@ static int brutal_set_params(struct sock *sk, char __user *optval, unsigned int 
 
     brutal->rate = params.rate;
     brutal->cwnd_gain = params.cwnd_gain;
+    brutal->last_ramp_us = BRUTAL_RAMP_DISABLED;
 
     return 0;
 }
@@ -200,13 +219,8 @@ static void brutal_init(struct sock *sk)
 
     tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
-    {
-        u64 rate = READ_ONCE(brutal_default_rate);
-
-        if (rate < MIN_PACING_RATE)
-            rate = MIN_PACING_RATE;
-        brutal->rate = rate;
-    }
+    brutal->rate = START_RAMP_PACING_RATE;
+    brutal->last_ramp_us = 0;
     brutal->cwnd_gain = INIT_CWND_GAIN;
 
     memset(brutal->slots, 0, sizeof(brutal->slots));
@@ -244,7 +258,7 @@ static void brutal_update_rate(struct sock *sk)
     u32 total;
     u32 loss_pct = 0;
     u32 ack_rate; // Scaled by 100 (100=1.00) as kernel doesn't support float
-    u64 rate = brutal->rate;
+    u64 rate;
     u32 cwnd;
 
     u32 mss = tp->mss_cache;
@@ -271,6 +285,49 @@ static void brutal_update_rate(struct sock *sk)
         loss_pct = losses * 100 / total;
     }
 
+    /* Ramp base rate from START_RAMP_PACING_RATE toward tcp_brutal_default_rate; pause while loss is high. */
+    {
+        u64 def = READ_ONCE(brutal_default_rate);
+        u64 now_us;
+        u64 rtt_us;
+
+        if (def < MIN_PACING_RATE)
+            def = MIN_PACING_RATE;
+
+        if (brutal->last_ramp_us != BRUTAL_RAMP_DISABLED) {
+            unsigned long thresh = READ_ONCE(brutal_loss_slow_thresh);
+            bool loss_blocks_ramp = (thresh > 0 && thresh < 100 &&
+                         total >= MIN_PKT_INFO_SAMPLES && loss_pct > thresh);
+
+            if (brutal->rate > def)
+                brutal->rate = def;
+
+            if (!loss_blocks_ramp && brutal->rate < def) {
+                now_us = brutal_tcp_stamp_us(tp);
+                rtt_us = (u64)rtt_ms * USEC_PER_MSEC;
+                if (rtt_us < USEC_PER_MSEC)
+                    rtt_us = USEC_PER_MSEC;
+
+                if (!brutal->last_ramp_us) {
+                    brutal->last_ramp_us = now_us;
+                } else if (now_us - brutal->last_ramp_us >= rtt_us) {
+                    u64 cur = brutal->rate;
+                    u64 new_rate;
+
+                    if (cur > U64_MAX / 2)
+                        new_rate = def;
+                    else
+                        new_rate = cur * 2;
+                    if (new_rate > def)
+                        new_rate = def;
+                    brutal->rate = new_rate;
+                    brutal->last_ramp_us = now_us;
+                }
+            }
+        }
+    }
+
+    rate = brutal->rate;
     rate *= 100;
     rate = div_u64(rate, ack_rate);
 
