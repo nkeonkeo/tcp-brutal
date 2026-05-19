@@ -20,7 +20,7 @@ jobs:
         run: |
           make dkms-tarball
           mkdir -p build/
-          mv dkms.tar.gz build/tcp-brutal.dkms.tar.gz
+          cp tcp-bbrx.dkms.tar.gz build/
 
       - name: Generate hashes
         run: |

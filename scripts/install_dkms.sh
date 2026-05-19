@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install_dkms.sh - tcp-brutal dkms module install script
+# install_dkms.sh - tcp-bbrx dkms module install script
 # Try `install_dkms.sh --help` for usage.
 #
 # SPDX-License-Identifier: MIT
@@ -30,8 +30,8 @@ REPO_URL="https://github.com/nkeonkeo/tcp-brutal"
 # export ALL_PROXY=socks5h://192.0.2.1:1080
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-DKMS_MODULE_NAME="tcp-brutal"
-KERNEL_MODULE_NAME="brutal"
+DKMS_MODULE_NAME="tcp-bbrx"
+KERNEL_MODULE_NAME="tcp_bbrx"
 
 
 ###
@@ -57,7 +57,7 @@ curl() {
 }
 
 mktemp() {
-  command mktemp "$@" "/tmp/brutalinst.XXXXXXXXXX"
+  command mktemp "$@" "/tmp/bbrxinst.XXXXXXXXXX"
 }
 
 tput() {
@@ -447,24 +447,24 @@ vercmp() {
 
 show_usage_and_exit() {
   echo
-  echo -e "\t${tbold}$(script_name)${treset} - tcp-brutal dkms install script"
+  echo -e "\t${tbold}$(script_name)${treset} - tcp-bbrx dkms install script"
   echo
   echo -e "Usage:"
   echo
-  echo -e "${tbold}Install tcp-brutal${treset}"
+  echo -e "${tbold}Install tcp-bbrx${treset}"
   echo -e "\t$(script_name) [install] [ -f | -l <file> | --version <version> ]"
   echo -e "Options:"
   echo -e "\t-f, --force\tForce re-install latest or specified version even if it has been installed."
   echo -e "\t-l, --local <file>\tInstall specified DKMS tarball instead of download it."
   echo -e "\t--version <version>\tInstall specified version instead of the latest."
   echo
-  echo -e "${tbold}Uninstall tcp-brutal${treset}"
+  echo -e "${tbold}Uninstall tcp-bbrx${treset}"
   echo -e "\t$(script_name) uninstall"
   echo
   echo -e "${tbold}Check for the status & update${treset}"
   echo -e "\t$(script_name) check"
   echo
-  echo -e "${tbold}Reload / Unload tcp-brutal kernel module${treset}"
+  echo -e "${tbold}Reload / Unload tcp-bbrx kernel module${treset}"
   echo -e "\t$(script_name) [re]load"
   echo -e "\t$(script_name) unload"
   echo
@@ -603,15 +603,56 @@ kmod_is_loaded() {
   lsmod | grep -qP '\b'"$_module"'\b'
 }
 
+kmod_find_installed() {
+  local _module="$1"
+  local _kver
+
+  _kver="$(uname -r)"
+  find "/lib/modules/$_kver" -name "${_module}.ko" -print -quit 2>/dev/null
+}
+
+dkms_show_build_hint() {
+  local _module="$1"
+  local _log
+
+  error "DKMS may have failed to build $_module for kernel $(uname -r)."
+  for _log in /var/lib/dkms/"$_module"/*/build/make.log; do
+    if [[ -f "$_log" ]]; then
+      note "Last build log: $_log"
+      note "Tail:"
+      tail -n 20 "$_log" | sed 's/^/\t/' >&2
+      return
+    fi
+  done
+  note "Try: dkms status; dkms install $_module/<version> -k $(uname -r)"
+}
+
 kmod_load_if_unloaded() {
   local _module="$1"
+  local _ko _err
 
   if ! kmod_is_loaded "$_module"; then
+    _ko="$(kmod_find_installed "$_module")"
+    if [[ -z "$_ko" ]]; then
+      dkms_show_build_hint "$DKMS_MODULE_NAME"
+      error "No ${_module}.ko found under /lib/modules/$(uname -r)/ — module was not built."
+      return 1
+    fi
     echo -n "Loading kernel module $_module ... "
-    if modprobe "$_module"; then
+    _err="$(mktemp)"
+    if modprobe "$_module" 2>"$_err"; then
       echo "ok"
+      rm -f "$_err"
     else
-      error "Failed to load kernel module, kernel module might not be installed successfully."
+      error "Failed to load kernel module $_module."
+      if [[ -s "$_err" ]]; then
+        note "modprobe: $(tr '\n' ' ' < "$_err")"
+      fi
+      rm -f "$_err"
+      if has_command dmesg; then
+        note "Recent kernel messages:"
+        dmesg 2>/dev/null | tail -n 8 | sed 's/^/\t/' >&2 || true
+      fi
       return 1
     fi
   fi
@@ -686,7 +727,7 @@ get_latest_version() {
   local _api="https://api.github.com/repos/${_repo_path}/releases/latest"
   if ! curl -sS "$_api" \
       -H 'Accept: application/vnd.github+json' \
-      -H 'User-Agent: tcp-brutal-install-dkms-script' \
+      -H 'User-Agent: tcp-bbrx-install-dkms-script' \
       -o "$_tmpfile"; then
     rm -f "$_tmpfile"
     error "Failed to fetch the latest release from GitHub (${_api}), please check your network and try again."
@@ -709,7 +750,7 @@ download_dkms_tarball() {
   local _version="$1"
   local _destination="$2"
 
-  local _download_url="$REPO_URL/releases/download/$_version/tcp-brutal.dkms.tar.gz"
+  local _download_url="$REPO_URL/releases/download/$_version/tcp-bbrx.dkms.tar.gz"
   echo "Downloading DKMS tarball: $_download_url ..."
   if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
     error "Download failed, please check your network and try again."
@@ -824,11 +865,18 @@ perform_install() {
     warning "Error occurred in 'dkms autoinstall', please check above output."
   fi
 
+  if [[ -z "$(kmod_find_installed "$KERNEL_MODULE_NAME")" ]]; then
+    dkms_show_build_hint "$DKMS_MODULE_NAME"
+    error "tcp-bbrx DKMS package is present but ${KERNEL_MODULE_NAME}.ko was not built for $(uname -r)."
+    error "Install linux-headers-$(uname -r), then run: dkms install $DKMS_MODULE_NAME/<version> -k $(uname -r)"
+    exit 2
+  fi
+
   kmod_setup_autoload "$KERNEL_MODULE_NAME"
 
   if [[ -z "$_install_needed" ]]; then
     if ! kmod_load_if_unloaded "$KERNEL_MODULE_NAME"; then
-      warning "tcp-brutal is installed but failed to load."
+      warning "tcp-bbrx is installed but failed to load."
     fi
 
     echo "${tbold}There is nothing to do today.${treset}"
@@ -836,18 +884,18 @@ perform_install() {
   fi
 
   if ! kmod_unload_if_loaded "$KERNEL_MODULE_NAME"; then
-    warning "tcp-brutal is successfully update, but occupied by other process, please reboot your server to active the latest change."
+    warning "tcp-bbrx is successfully update, but occupied by other process, please reboot your server to active the latest change."
     exit 0
   fi
 
   if ! kmod_load_if_unloaded "$KERNEL_MODULE_NAME"; then
-    error "tcp-brutal is successfully installed, but failed to load, this might cause by mismatched linux-headers."
+    error "tcp-bbrx is successfully installed, but failed to load, this might cause by mismatched linux-headers."
     error "If you update your system recently, reboot the system might solve this."
     exit 2
   fi
 
   echo
-  echo -e "${tbold}Congratulation! tcp-brutal $_version has been successfully installed and loaded on your server.${treset}"
+  echo -e "${tbold}Congratulation! tcp-bbrx $_version has been successfully installed and loaded on your server.${treset}"
 }
 
 perform_uninstall() {
@@ -865,13 +913,13 @@ perform_uninstall() {
   dkms_remove_modules "$DKMS_MODULE_NAME" ""
 
   if ! kmod_unload_if_loaded "$KERNEL_MODULE_NAME"; then
-    warning "tcp-brutal is successfully uninstall from your server, but failed to unload from the kernel."
+    warning "tcp-bbrx is successfully uninstall from your server, but failed to unload from the kernel."
     warning "Please reboot your system to unload it from the kernel."
     exit 0
   fi
 
   echo
-  echo -e "${tbold}Congratulation! tcp-brutal has been successfully uninstalled and unloaded."
+  echo -e "${tbold}Congratulation! tcp-bbrx has been successfully uninstalled and unloaded."
 }
 
 perform_check() {

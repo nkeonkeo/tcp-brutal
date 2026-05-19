@@ -1,113 +1,39 @@
-# ![TCP Brutal](logo.png)
+# TCP BBRX
 
-TCP Brutal is [Hysteria](https://hysteria.network/)'s congestion control algorithm ported to TCP, as a Linux kernel module. Information about Brutal itself can be found in the [Hysteria documentation](https://hysteria.network/docs/advanced/Full-Server-Config/#bandwidth-behavior-explained). As an official subproject of Hysteria, TCP Brutal is actively maintained to be in sync with the Brutal implementation in Hysteria.
+Out-of-tree Linux kernel module: BBR-derived congestion control registered as **`bbrx`**, with a tunable loss threshold via sysctl.
 
-**中文文档：[README.zh.md](README.zh.md)**
-
-## For users
-
-Installation script:
+## Build & load
 
 ```bash
-bash <(curl -fsSL https://tcp.hy2.sh/)
+sudo apt install linux-headers-$(uname -r) build-essential   # Debian/Ubuntu
+make
+sudo make load      # insmod tcp_bbrx.ko
+sudo make unload
 ```
 
-Manual compilation and loading:
+## DKMS
 
 ```bash
-# Make sure kernel headers are installed
-# Ubuntu: apt install linux-headers-$(uname -r)
-make && make load
+make dkms-tarball
+sudo ./scripts/install_dkms.sh install -l ./tcp-bbrx.dkms.tar.gz
 ```
 
-### NixOS
-
-If you are using NixOS with flakes, you can add the module directly to your `flake.nix`:
-
-```nix
-{
-  inputs.tcp-brutal.url = "github:apernet/tcp-brutal";
-  
-  outputs = { nixpkgs, tcp-brutal, ... }: {
-    nixosConfigurations.myHost = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        # ... your configuration.nix ...
-        tcp-brutal.nixosModules.default
-        { boot.tcp-brutal.enable = true; }
-      ];
-    };
-  };
-}
-```
-
-> Kernel version 4.9 or later is required, version 5.8 or later is recommended. **If your kernel version is earlier than 5.8, only IPv4 is supported.** [(lack of exported symbol `tcpv6_prot`)](https://github.com/torvalds/linux/commit/6abde0b241224347cd88e2ae75902e07f55c42cb#diff-8b341e52e57c996bc4f294087ab526ac0b1c3c47e045557628cc24277cbfda0dR2124)
->
-> **⚠️ Warning** For systems with kernel versions lower than 4.13, you MUST manually enable fq pacing (`tc qdisc add dev eth0 root fq pacing`), otherwise TCP Brutal will not work properly.
-
-### Do I need a new proxy protocol?
-
-No. TCP Brutal supports all existing TCP proxy protocols, **but requires support from both the client and server software** (to provide bandwidth options, exchange bandwidth information, etc.). Ask the developers of the proxy software you use to add support.
-
-### Speed test
-
-The [example](example) directory contains a simple speed test server+client in Python. Usage:
+## Usage
 
 ```bash
-# Server, listening on TCP port 1234
-python server.py -p 1234
-
-# Client, connect to example.com:1234, request download speed of 50 Mbps
-python client.py -p 1234 example.com 50
+sysctl net.ipv4.tcp_available_congestion_control
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbrx
 ```
 
-### Do I need to configure sysctl? / Can I set TCP Brutal as the system's default congestion control?
+Per-socket: `setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "bbrx", 4);`
 
-Usually you don't need to. Unlike BBR, TCP Brutal only has well-defined behavior after the program sets the bandwidth per connection via `TCP_BRUTAL_PARAMS`; most programs do not. If you still make Brutal the system default, connections that never set the sockopt use the module's built-in initial target rate (about 1 Mbps by default), which can slow the whole host.
+## Sysctl
 
-On kernels built with `CONFIG_SYSCTL`, loading this module registers **`net.ipv4.tcp_brutal_default_rate`** (unit: **bytes per second**). It controls that initial target rate before `TCP_BRUTAL_PARAMS` is set; it is writable with the same minimum as the sockopt (62500, i.e. 500 Kbps). Connections that already set the sockopt are unaffected. Applications with Brutal support should still select the congestion algorithm and set parameters explicitly.
+| Parameter | Description |
+|-----------|-------------|
+| `net.ipv4.tcp_bbrx_loss_thresh` | Loss ratio threshold (0–99 %), default **10** |
 
-It also registers **`net.ipv4.tcp_brutal_loss_slow_thresh`** (**0–100**, loss percentage). When there are enough ACK/loss samples in the recent window, if the loss rate **exceeds** this threshold the effective rate used for pacing and cwnd is scaled down (more loss means a lower cap, down to about 15% of the pre-penalty value). **0** or **100** disables this logic. The default is **30**. Without `CONFIG_SYSCTL`, the threshold is fixed at 30 in the module.
+## Requirements
 
-## For developers
-
-This kernel module adds a new "brutal" TCP congestion control algorithm to the system, which programs can enable using TCP_CONGESTION sockopt.
-
-```python
-s.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, "brutal".encode())
-```
-
-To set the send rate and congestion window gain (we recommend a default value of 1.5x to 2x, which is expressed as 15/20 since the kernel doesn't support floating point):
-
-```c
-struct brutal_params
-{
-    u64 rate;      // Send rate in bytes per second
-    u32 cwnd_gain; // CWND gain in tenths (10=1.0)
-} __packed;
-```
-
-```python
-TCP_BRUTAL_PARAMS = 23301
-
-rate = 2000000 # 2 MB/s
-cwnd_gain = 15
-brutal_params_value = struct.pack("QI", rate, cwnd_gain)
-conn.setsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_PARAMS, brutal_params_value)
-```
-
-### For proxy developers (important)
-
-Like Hysteria, Brutal is designed for environments where the user knows the bandwidth of their connection, as this information is essential for Brutal to work. While Hysteria's protocol is designed with this in mind, none of the existing TCP proxy protocols (at the time of this writing) have such a mechanism for exchanging bandwidth information between client and server, so that a client can tell the server how fast it should send and vice versa.
-
-To work around this, we suggest using the "destination address" field, which every proxy protocol has in one form or another. Clients and servers supporting TCP Brutal can use a special address (e.g. `_BrutalBwExchange`) to indicate that they want to exchange bandwidth information. For example, the client can create a `_BrutalBwExchange` connection request and, if the server accepts, use that connection to exchange bandwidth information with the server.
-
-The following link shows how this is implemented in sing-box:
-
-<https://github.com/SagerNet/sing-mux/commit/6b086ed6bb0790160de73b16683e75efe2220a79>
-
-An important aspect to understand about TCP Brutal's rate setting is that it applies to each individual connection. **This makes it suitable only for protocols that support multiplexing (mux), which allows a client to consolidate all proxy connections into a single TCP connection.** For protocols that require a separate connection for each proxy connection, using TCP Brutal will overwhelm the receiver if multiple connections are active at the same time.
-
-### Compatibility
-
-TCP Brutal is only a congestion control algorithm for TCP and does not alter the TCP protocol itself. Clients and servers can use TCP Brutal unilaterally. The congestion control algorithm controls the sending of data, and since proxy users typically download far more data than they upload, implementing TCP Brutal on the server side alone can reap most of the benefits. (Clients using TCP Brutal could achieve better upload speeds, but many users are on Windows, MacOS, or phones where installing kernel modules is impractical).
+- Linux **5.15+** (tested on 5.15 / 6.6)
+- `linux-headers` matching `uname -r`

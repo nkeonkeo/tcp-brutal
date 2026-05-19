@@ -1,5 +1,5 @@
 {
-  description = "TCP Brutal - TCP congestion control algorithm";
+  description = "TCP BBRX - TCP congestion control algorithm";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -8,8 +8,8 @@
 
   outputs = { self, nixpkgs, flake-utils }:
     let
-      mkTcpBrutal = pkgs: kernel: pkgs.stdenv.mkDerivation {
-        pname = "tcp-brutal";
+      mkTcpBbrx = pkgs: kernel: pkgs.stdenv.mkDerivation {
+        pname = "tcp-bbrx";
         version = self.shortRev or self.dirtyShortRev or "unknown";
         src = ./.;
         nativeBuildInputs = kernel.moduleBuildDependencies;
@@ -29,24 +29,24 @@
           runHook postInstall
         '';
         meta = with pkgs.lib; {
-          description = "TCP Brutal congestion control algorithm";
-          homepage = "https://github.com/apernet/tcp-brutal";
-          license = licenses.gpl3Only;
+          description = "TCP BBRX congestion control algorithm";
+          homepage = "https://github.com/nkeonkeo/tcp-brutal";
+          license = licenses.gpl2Plus;
           platforms = platforms.linux;
         };
       };
     in
     flake-utils.lib.eachDefaultSystem (system:
       let pkgs = import nixpkgs { inherit system; }; in {
-        packages.default = mkTcpBrutal pkgs pkgs.linuxPackages.kernel;
-        lib.mkTcpBrutal = mkTcpBrutal pkgs;
+        packages.default = mkTcpBbrx pkgs pkgs.linuxPackages.kernel;
+        lib.mkTcpBbrx = mkTcpBbrx pkgs;
       }
     ) // {
       nixosModules.default = { config, lib, pkgs, ... }: {
-        options.boot.tcp-brutal.enable = lib.mkEnableOption "tcp-brutal kernel module";
-        config = lib.mkIf config.boot.tcp-brutal.enable {
-          boot.extraModulePackages = [ (self.outputs.lib.${pkgs.system}.mkTcpBrutal config.boot.kernelPackages.kernel) ];
-          boot.kernelModules = [ "brutal" ];
+        options.boot.tcp-bbrx.enable = lib.mkEnableOption "tcp-bbrx kernel module";
+        config = lib.mkIf config.boot.tcp-bbrx.enable {
+          boot.extraModulePackages = [ (self.outputs.lib.${pkgs.system}.mkTcpBbrx config.boot.kernelPackages.kernel) ];
+          boot.kernelModules = [ "tcp_bbrx" ];
         };
       };
     };
