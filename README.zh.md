@@ -37,7 +37,7 @@ sudo sysctl -w net.ipv4.tcp_congestion_control=bbrx
 
 | 参数 | 说明 |
 |------|------|
-| `net.ipv4.tcp_bbrx_loss_thresh` | 长时带宽估计中的丢包率阈值（**0–99**，单位 %），默认 **10** |
+| `net.ipv4.tcp_bbrx_loss_thresh` | 允许继续向上探测带宽的最大丢包率（**0–99**，单位 %），默认 **10**；超过则恢复标准 BBR 行为 |
 
 ## 要求
 
