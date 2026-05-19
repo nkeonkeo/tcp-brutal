@@ -65,66 +65,8 @@
 
 #include "bbrx-compat.h"
 
-#include <linux/hashtable.h>
-#include <linux/spinlock.h>
-
 #define BBRX_LOSS_SLOTS		3
 #define BBRX_MIN_LOSS_SAMPLES	50
-#define BBRX_STATS_HASH_BITS	8
-
-struct bbrx_sock_stats {
-	struct hlist_node node;
-	struct sock *sk;
-	u32 loss_w_acked;
-	u32 loss_w_losses;
-	u32 loss_w_start_sec;
-};
-
-static DEFINE_SPINLOCK(bbrx_stats_lock);
-static struct hlist_head bbrx_stats_ht[1 << BBRX_STATS_HASH_BITS];
-
-static struct bbrx_sock_stats *bbrx_stats_find(struct sock *sk, bool create)
-{
-	struct bbrx_sock_stats *st;
-	unsigned long flags;
-
-	spin_lock_irqsave(&bbrx_stats_lock, flags);
-	hash_for_each_possible(bbrx_stats_ht, st, node,
-				       (unsigned long)sk) {
-		if (st->sk == sk) {
-			spin_unlock_irqrestore(&bbrx_stats_lock, flags);
-			return st;
-		}
-	}
-	if (!create) {
-		spin_unlock_irqrestore(&bbrx_stats_lock, flags);
-		return NULL;
-	}
-	st = kzalloc(sizeof(*st), GFP_ATOMIC);
-	if (st) {
-		st->sk = sk;
-		hash_add(bbrx_stats_ht, &st->node, (unsigned long)sk);
-	}
-	spin_unlock_irqrestore(&bbrx_stats_lock, flags);
-	return st;
-}
-
-static void bbrx_stats_free(struct sock *sk)
-{
-	struct bbrx_sock_stats *st;
-	unsigned long flags;
-
-	spin_lock_irqsave(&bbrx_stats_lock, flags);
-	hash_for_each_possible(bbrx_stats_ht, st, node,
-				       (unsigned long)sk) {
-		if (st->sk == sk) {
-			hash_del(&st->node);
-			kfree(st);
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&bbrx_stats_lock, flags);
-}
 
 #ifndef BBRX_NO_BTF
 #include <linux/btf.h>
@@ -171,7 +113,8 @@ struct bbr {
 		round_start:1,	     /* start of packet-timed tx->ack round? */
 		idle_restart:1,	     /* restarting after idle? */
 		probe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
-		unused:13,
+		may_probe_cached:1,  /* loss gate for this ACK (no global lock) */
+		unused:12,
 		lt_is_sampling:1,    /* taking long-term ("LT") samples now? */
 		lt_rtt_cnt:7,	     /* round trips in long-term interval */
 		lt_use_bw:1;	     /* use lt_bw as our bw estimate? */
@@ -259,6 +202,9 @@ static const u32 bbr_lt_intvl_min_rtts = 4;
  */
 #if IS_ENABLED(CONFIG_SYSCTL)
 static unsigned int bbrx_loss_thresh_percent = 10;
+#if IS_ENABLED(CONFIG_SYSCTL)
+static unsigned int bbrx_startup_ack_mul = 2;
+#endif
 #define bbr_lt_loss_thresh \
 	((u32)((u64)BBR_UNIT * bbrx_loss_thresh_percent / 100))
 #else
@@ -301,38 +247,39 @@ static u64 bbrx_sock_get_sec(const struct tcp_sock *tp)
 }
 #endif
 
+/*
+ * Loss window lives in lt_last_* while !lt_is_sampling (LT reuses them when
+ * active). Per-socket only — no global hash/spinlock (scales on multi-flow).
+ */
 static void bbrx_update_loss_window(struct sock *sk, const struct rate_sample *rs)
 {
-	struct bbrx_sock_stats *st = bbrx_stats_find(sk, true);
+	struct bbr *bbr = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	u32 sec;
 
-	if (!st || !rs)
+	if (!rs || bbr->lt_is_sampling)
 		return;
 
-	sec = (u32)bbrx_sock_get_sec(tcp_sk(sk));
-	if (!st->loss_w_start_sec ||
-	    sec - st->loss_w_start_sec >= BBRX_LOSS_SLOTS) {
-		st->loss_w_start_sec = sec;
-		st->loss_w_acked = 0;
-		st->loss_w_losses = 0;
+	sec = (u32)bbrx_sock_get_sec(tp);
+	if (!bbr->lt_last_stamp ||
+	    sec - bbr->lt_last_stamp >= BBRX_LOSS_SLOTS) {
+		bbr->lt_last_stamp = sec;
+		bbr->lt_last_delivered = 0;
+		bbr->lt_last_lost = 0;
 	}
 	if (rs->acked_sacked)
-		st->loss_w_acked += rs->acked_sacked;
+		bbr->lt_last_delivered += rs->acked_sacked;
 	if (rs->losses > 0)
-		st->loss_w_losses += rs->losses;
+		bbr->lt_last_lost += rs->losses;
 }
 
-static u32 bbrx_loss_percent(struct sock *sk)
+static u32 bbrx_loss_percent(const struct bbr *bbr)
 {
-	struct bbrx_sock_stats *st = bbrx_stats_find(sk, false);
-	u32 total;
+	u32 total = bbr->lt_last_delivered + bbr->lt_last_lost;
 
-	if (!st)
-		return (u32)-1;
-	total = st->loss_w_acked + st->loss_w_losses;
 	if (total < BBRX_MIN_LOSS_SAMPLES)
 		return (u32)-1;
-	return st->loss_w_losses * 100 / total;
+	return bbr->lt_last_lost * 100 / total;
 }
 
 static bool bbrx_may_probe_more(struct sock *sk)
@@ -342,14 +289,35 @@ static bool bbrx_may_probe_more(struct sock *sk)
 #else
 	unsigned int thresh = 10;
 #endif
+	struct bbr *bbr = inet_csk_ca(sk);
 	u32 loss_pct;
 
 	if (thresh >= 99)
 		return true;
-	loss_pct = bbrx_loss_percent(sk);
+	loss_pct = bbrx_loss_percent(bbr);
 	if (loss_pct == (u32)-1)
 		return true;
 	return loss_pct <= thresh;
+}
+
+static bool bbrx_may_probe_cached(const struct sock *sk)
+{
+	return ((const struct bbr *)inet_csk_ca(sk))->may_probe_cached;
+}
+
+static u32 bbrx_startup_ack_scale(void)
+{
+#if IS_ENABLED(CONFIG_SYSCTL)
+	u32 mul = READ_ONCE(bbrx_startup_ack_mul);
+
+	if (mul < 1)
+		mul = 1;
+	if (mul > 8)
+		mul = 8;
+	return mul;
+#else
+	return 2;
+#endif
 }
 
 static void bbrx_apply_aggressive_probe(struct sock *sk, bool may_probe)
@@ -455,7 +423,7 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 
 	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
 		bbr_init_pacing_rate_from_rtt(sk);
-	if (bbrx_may_probe_more(sk)) {
+	if (bbrx_may_probe_cached(sk)) {
 		if (rate > sk->sk_pacing_rate)
 			sk->sk_pacing_rate = rate;
 	} else if (bbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate) {
@@ -653,7 +621,7 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	u8 prev_state = bbr->prev_ca_state, state = inet_csk(sk)->icsk_ca_state;
 	u32 cwnd = tcp_snd_cwnd(tp);
 
-	if (bbrx_may_probe_more(sk)) {
+	if (bbrx_may_probe_cached(sk)) {
 		bbr->prev_ca_state = state;
 		*new_cwnd = cwnd;
 		return false;
@@ -712,10 +680,15 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
 
 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
-	if (bbrx_may_probe_more(sk)) {
-		cwnd = cwnd + acked;
-		if (target_cwnd)
-			cwnd = max(cwnd, target_cwnd);
+	if (bbrx_may_probe_cached(sk)) {
+		u32 ack_mul = bbrx_startup_ack_scale();
+		u32 hi_target;
+
+		hi_target = bbr_bdp(sk, bw, bbr_high_gain);
+		hi_target += bbr_ack_aggregation_cwnd(sk);
+		hi_target = bbr_quantization_budget(sk, hi_target);
+		cwnd += acked * ack_mul;
+		cwnd = max(cwnd, max(target_cwnd, hi_target));
 	} else if (bbr_full_bw_reached(sk))  /* only cut cwnd if we filled the pipe */
 		cwnd = min(cwnd + acked, target_cwnd);
 	else if (cwnd < target_cwnd || tp->delivered < TCP_INIT_CWND)
@@ -755,7 +728,7 @@ static bool bbr_is_next_cycle_phase(struct sock *sk,
 	 */
 	if (bbr->pacing_gain > BBR_UNIT)
 		return is_full_length &&
-			((!bbrx_may_probe_more(sk) && rs->losses) ||
+			((!bbrx_may_probe_cached(sk) && rs->losses) ||
 			 inflight >= bbr_inflight(sk, bw, bbr->pacing_gain));
 
 	/* A pacing_gain < 1.0 tries to drain extra queue we added if bw
@@ -871,7 +844,7 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	u64 bw;
 	u32 t;
 
-	if (bbrx_may_probe_more(sk))
+	if (bbrx_may_probe_cached(sk))
 		return;
 
 	if (bbr->lt_use_bw) {	/* already using long-term rate, lt_bw? */
@@ -976,7 +949,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 * network rate no matter how long. We automatically leave this
 	 * phase when app writes faster than the network can deliver :)
 	 */
-	if (bbrx_may_probe_more(sk) && rs->losses > 0 && bw < bbr_max_bw(sk)) {
+	if (bbrx_may_probe_cached(sk) && rs->losses > 0 && bw < bbr_max_bw(sk)) {
 		/* Keep probing: ignore lossy low-delivery samples for max_bw. */
 	} else if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
@@ -1059,7 +1032,7 @@ static void bbr_check_full_bw_reached(struct sock *sk,
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 bw_thresh;
 
-	if (bbrx_may_probe_more(sk))
+	if (bbrx_may_probe_cached(sk))
 		return;
 	if (bbr_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
 		return;
@@ -1140,7 +1113,8 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	}
 
 	if (bbr_probe_rtt_mode_ms > 0 && filter_expired &&
-	    !bbr->idle_restart && bbr->mode != BBR_PROBE_RTT) {
+	    !bbr->idle_restart && bbr->mode != BBR_PROBE_RTT &&
+	    !bbrx_may_probe_cached(sk)) {
 		bbr->mode = BBR_PROBE_RTT;  /* dip, drain queue */
 		bbr_save_cwnd(sk);  /* note cwnd so we can restore it */
 		bbr->probe_rtt_done_stamp = 0;
@@ -1172,6 +1146,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 static void bbr_update_gains(struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
+	bool fast_start = bbrx_may_probe_cached(sk);
 
 	switch (bbr->mode) {
 	case BBR_STARTUP:
@@ -1196,6 +1171,8 @@ static void bbr_update_gains(struct sock *sk)
 		WARN_ONCE(1, "BBR bad mode: %u\n", bbr->mode);
 		break;
 	}
+	if (fast_start)
+		bbr->cwnd_gain = bbr_high_gain;
 }
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
@@ -1217,6 +1194,7 @@ __bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
 
 	bbrx_update_loss_window(sk, rs);
 	may_probe = bbrx_may_probe_more(sk);
+	bbr->may_probe_cached = may_probe;
 	bbrx_apply_aggressive_probe(sk, may_probe);
 
 	bbr_update_model(sk, rs);
@@ -1224,11 +1202,6 @@ __bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
 	bw = bbr_bw(sk);
 	bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
 	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain);
-}
-
-static void bbr_release(struct sock *sk)
-{
-	bbrx_stats_free(sk);
 }
 
 __bpf_kfunc static void bbr_init(struct sock *sk)
@@ -1270,9 +1243,9 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
 	bbr->extra_acked[0] = 0;
 	bbr->extra_acked[1] = 0;
 
-	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+	bbr->may_probe_cached = 1;
 
-	bbrx_stats_find(sk, true);
+	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
 __bpf_kfunc static u32 bbr_sndbuf_expand(struct sock *sk)
@@ -1342,7 +1315,6 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 	.name		= "bbrx",
 	.owner		= THIS_MODULE,
 	.init		= bbr_init,
-	.release	= bbr_release,
 	.cong_control	= bbr_main,
 	.sndbuf_expand	= bbr_sndbuf_expand,
 	.undo_cwnd	= bbr_undo_cwnd,
@@ -1390,6 +1362,17 @@ static struct ctl_table bbrx_sysctl_table[] = {
 		.extra2		= &bbrx_loss_thresh_percent_max,
 	},
 	{ }
+#if IS_ENABLED(CONFIG_SYSCTL)
+	, {
+		.procname	= "tcp_bbrx_startup_ack_mul",
+		.data		= &bbrx_startup_ack_mul,
+		.maxlen		= sizeof(bbrx_startup_ack_mul),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= (void *)1UL,
+		.extra2		= (void *)8UL,
+	},
+#endif
 };
 
 static struct ctl_table_header *bbrx_sysctl_header;
