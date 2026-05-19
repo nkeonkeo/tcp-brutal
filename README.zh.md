@@ -45,5 +45,6 @@ sudo sysctl -w net.ipv4.tcp_congestion_control=bbrx
 
 ## 要求
 
-- Linux **5.15+**（已在 5.15 / 6.6 上验证编译）
-- 与内核版本匹配的 `linux-headers-$(uname -r)`
+- Linux **6.1+**（**Debian 12** bookworm / **Debian 13** trixie 及同系列云镜像）
+- 与内核版本匹配的 `linux-headers-$(uname -r)`（`apt install linux-headers-$(uname -r)`）
+- 每个内核单独 DKMS 编译，不可把为其他版本构建的 `.ko` 直接拷贝使用

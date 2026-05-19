@@ -18,6 +18,8 @@
 #define GSO_LEGACY_MAX_SIZE GSO_MAX_SIZE
 #endif
 
+/* Debian 12 (6.1) / 13 (6.12+): tcp_bbrx.c branches cong_control at 6.10+. */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static inline u32 bbrx_get_random_u32_below(u32 ceil)
 {

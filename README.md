@@ -39,5 +39,6 @@ Per-connection loss stats with enter/exit hysteresis reduce throughput cliffs un
 
 ## Requirements
 
-- Linux **5.15+** (tested on 5.15 / 6.6)
+- Linux **6.1+** (Debian **12** bookworm, Debian **13** trixie, and similar cloud images)
 - `linux-headers` matching `uname -r`
+- Build per kernel via DKMS; do not reuse a `.ko` built for a different kernel version

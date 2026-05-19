@@ -1201,7 +1201,8 @@ static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
 	bbr_update_gains(sk);
 }
 
-__bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
+/* Core ACK path (shared across kernel versions). */
+__bpf_kfunc static void bbr_main_impl(struct sock *sk, const struct rate_sample *rs)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool may_probe;
@@ -1218,6 +1219,20 @@ __bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
 	bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
 	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain);
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+/* Linux 6.10+ (e.g. Debian 13): cong_control gained ack, flag (commit 57bfc76). */
+__bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag,
+				 const struct rate_sample *rs)
+{
+	bbr_main_impl(sk, rs);
+}
+#else
+__bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
+{
+	bbr_main_impl(sk, rs);
+}
+#endif
 
 __bpf_kfunc static void bbr_init(struct sock *sk)
 {
