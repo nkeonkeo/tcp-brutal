@@ -37,11 +37,11 @@ sudo sysctl -w net.ipv4.tcp_congestion_control=bbrx
 
 | 参数 | 说明 |
 |------|------|
-| `net.ipv4.tcp_bbrx_startup_ack_mul` | 激进模式下每个 ACK 的 cwnd 增量倍数（**1–8**），默认 **2** |
-| `net.ipv4.tcp_bbrx_loss_thresh` | 允许继续向上探测带宽的最大丢包率（**0–99**，单位 %），默认 **10**；超过则恢复标准 BBR 行为 |
-| `net.ipv4.tcp_bbrx_startup_ack_mul` | 激进模式下每个 ACK 的 cwnd 增量倍数（**1–8**），默认 **2** |
+| `net.ipv4.tcp_bbrx_loss_thresh` | 进入/保持激进探测的丢包率上限（**0–99** %），默认 **15** |
+| `net.ipv4.tcp_bbrx_loss_thresh_exit` | 退出激进探测的丢包率下限（**0–99** %），默认 **25**（须高于 `loss_thresh`，多流 iperf 防抖动） |
+| `net.ipv4.tcp_bbrx_startup_ack_mul` | 激进模式下每个 ACK 的 cwnd 增量倍数（**1–8**），默认 **2**；多流压测可试 **1** |
 
-多连接 / 多线程：丢包统计保存在每条连接的 `struct bbr` 内（无全局锁），适合高并发多流场景。
+多连接 / 多线程：丢包统计 per-socket（无全局锁）；丢包率带迟滞，避免 iperf3 `-P` 多流时因瞬时超阈而速度断崖下跌。
 
 ## 要求
 

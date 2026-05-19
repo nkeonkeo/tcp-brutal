@@ -31,10 +31,11 @@ Per-socket: `setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "bbrx", 4);`
 
 | Parameter | Description |
 |-----------|-------------|
+| `net.ipv4.tcp_bbrx_loss_thresh` | Max loss % to enter/stay in aggressive probe mode, default **15** |
+| `net.ipv4.tcp_bbrx_loss_thresh_exit` | Loss % to exit aggressive mode, default **25** (hysteresis for multi-stream iperf) |
 | `net.ipv4.tcp_bbrx_startup_ack_mul` | CWND increase multiplier per ACK in aggressive mode (**1–8**), default **2** |
-| `net.ipv4.tcp_bbrx_loss_thresh` | Loss ratio threshold (0–99 %), default **10** |
 
-Per-connection loss stats are stored in `struct bbr` (no global spinlock), which scales better for many parallel flows / threaded servers.
+Per-connection loss stats with enter/exit hysteresis reduce throughput cliffs under `iperf3 -P` on a shared bottleneck.
 
 ## Requirements
 

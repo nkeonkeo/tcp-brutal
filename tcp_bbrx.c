@@ -114,7 +114,8 @@ struct bbr {
 		idle_restart:1,	     /* restarting after idle? */
 		probe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
 		may_probe_cached:1,  /* loss gate for this ACK (no global lock) */
-		unused:12,
+		aggressive_sticky:1, /* hysteresis: stay aggressive until loss > exit */
+		unused:11,
 		lt_is_sampling:1,    /* taking long-term ("LT") samples now? */
 		lt_rtt_cnt:7,	     /* round trips in long-term interval */
 		lt_use_bw:1;	     /* use lt_bw as our bw estimate? */
@@ -201,14 +202,13 @@ static const u32 bbr_lt_intvl_min_rtts = 4;
  * While recent loss%% <= thresh, BBRX keeps probing for more bandwidth.
  */
 #if IS_ENABLED(CONFIG_SYSCTL)
-static unsigned int bbrx_loss_thresh_percent = 10;
-#if IS_ENABLED(CONFIG_SYSCTL)
+static unsigned int bbrx_loss_thresh_percent = 15;
+static unsigned int bbrx_loss_thresh_exit_percent = 25;
 static unsigned int bbrx_startup_ack_mul = 2;
-#endif
 #define bbr_lt_loss_thresh \
 	((u32)((u64)BBR_UNIT * bbrx_loss_thresh_percent / 100))
 #else
-static const u32 bbr_lt_loss_thresh = BBR_UNIT * 10 / 100;
+static const u32 bbr_lt_loss_thresh = BBR_UNIT * 15 / 100;
 #endif
 /* If 2 intervals have a bw ratio <= 1/8, their bw is "consistent": */
 static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
@@ -285,19 +285,34 @@ static u32 bbrx_loss_percent(const struct bbr *bbr)
 static bool bbrx_may_probe_more(struct sock *sk)
 {
 #if IS_ENABLED(CONFIG_SYSCTL)
-	unsigned int thresh = READ_ONCE(bbrx_loss_thresh_percent);
+	unsigned int enter = READ_ONCE(bbrx_loss_thresh_percent);
+	unsigned int exit = READ_ONCE(bbrx_loss_thresh_exit_percent);
 #else
-	unsigned int thresh = 10;
+	unsigned int enter = 15;
+	unsigned int exit = 25;
 #endif
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 loss_pct;
 
-	if (thresh >= 99)
+	if (enter >= 99)
 		return true;
+	if (exit <= enter)
+		exit = min(enter + 10, 99U);
+	if (exit >= 99)
+		exit = 99;
+
 	loss_pct = bbrx_loss_percent(bbr);
+	/* Not enough samples: hold prior mode (avoids 3s window reset flapping). */
 	if (loss_pct == (u32)-1)
-		return true;
-	return loss_pct <= thresh;
+		return bbr->aggressive_sticky;
+
+	if (bbr->aggressive_sticky) {
+		if (loss_pct > exit)
+			bbr->aggressive_sticky = 0;
+	} else if (loss_pct <= enter) {
+		bbr->aggressive_sticky = 1;
+	}
+	return bbr->aggressive_sticky;
 }
 
 static bool bbrx_may_probe_cached(const struct sock *sk)
@@ -1243,6 +1258,7 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
 	bbr->extra_acked[0] = 0;
 	bbr->extra_acked[1] = 0;
 
+	bbr->aggressive_sticky = 1;
 	bbr->may_probe_cached = 1;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
@@ -1361,9 +1377,16 @@ static struct ctl_table bbrx_sysctl_table[] = {
 		.extra1		= &bbrx_loss_thresh_percent_min,
 		.extra2		= &bbrx_loss_thresh_percent_max,
 	},
-	{ }
-#if IS_ENABLED(CONFIG_SYSCTL)
-	, {
+	{
+		.procname	= "tcp_bbrx_loss_thresh_exit",
+		.data		= &bbrx_loss_thresh_exit_percent,
+		.maxlen		= sizeof(bbrx_loss_thresh_exit_percent),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &bbrx_loss_thresh_percent_min,
+		.extra2		= &bbrx_loss_thresh_percent_max,
+	},
+	{
 		.procname	= "tcp_bbrx_startup_ack_mul",
 		.data		= &bbrx_startup_ack_mul,
 		.maxlen		= sizeof(bbrx_startup_ack_mul),
@@ -1372,7 +1395,7 @@ static struct ctl_table bbrx_sysctl_table[] = {
 		.extra1		= (void *)1UL,
 		.extra2		= (void *)8UL,
 	},
-#endif
+	{ }
 };
 
 static struct ctl_table_header *bbrx_sysctl_header;
