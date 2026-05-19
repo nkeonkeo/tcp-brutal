@@ -259,3 +259,6 @@ $RECYCLE.BIN/
 
 /dkms.conf
 /dkms.tar.gz
+/bbrx/dkms.conf
+/bbrx/tcp-bbrx.dkms.tar.gz
+/bbrx/*.ko
