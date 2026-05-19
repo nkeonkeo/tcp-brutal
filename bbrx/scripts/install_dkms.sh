@@ -31,7 +31,7 @@ REPO_URL="https://github.com/nkeonkeo/tcp-brutal"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
 DKMS_MODULE_NAME="tcp-bbrx"
-KERNEL_MODULE_NAME="tcp_bbr"
+KERNEL_MODULE_NAME="tcp_bbrx"
 
 
 ###
