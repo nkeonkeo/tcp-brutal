@@ -10,10 +10,7 @@ KERNEL_RELEASE ?= $(shell uname -r)
 KERNEL_DIR     ?= /lib/modules/$(KERNEL_RELEASE)/build
 
 obj-m          += tcp_bbrx.o
-ccflags-y      := -std=gnu99
-
-# tcp_dctcp.h lives in the kernel tree (not shipped in this repo).
-ccflags-y      += -I$(KERNEL_DIR)/net/ipv4
+ccflags-y      := -std=gnu99 -DBBRX_OOT_MODULE
 
 KMOD           := tcp_bbrx.ko
 DKMS_TARBALL   ?= tcp-bbrx.dkms.tar.gz
@@ -25,7 +22,6 @@ TAR            ?= tar
 check-kernel-dir:
 	@test -d "$(KERNEL_DIR)" || (echo "Missing $(KERNEL_DIR); install linux-headers-$(KERNEL_RELEASE)" >&2; exit 1)
 	@test -f tcp_bbrx.c || (echo "Missing tcp_bbrx.c in $(CURDIR)" >&2; exit 1)
-	@test -f "$(KERNEL_DIR)/net/ipv4/tcp_dctcp.h" || (echo "Missing $(KERNEL_DIR)/net/ipv4/tcp_dctcp.h (kernel too old or incomplete headers?)" >&2; exit 1)
 
 all: check-kernel-dir
 	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) modules
@@ -40,12 +36,13 @@ dkms.conf: scripts/mkdkmsconf.sh
 clean-dkms.conf:
 	$(RM) -f dkms.conf
 
-$(DKMS_TARBALL): dkms.conf Makefile tcp_bbrx.c scripts/mkdkmsconf.sh
+$(DKMS_TARBALL): dkms.conf Makefile tcp_bbrx.c bbrx-compat.h scripts/mkdkmsconf.sh
 	$(TAR) zcf $(DKMS_TARBALL) \
 		--transform 's,^,./dkms_source_tree/,' \
 		dkms.conf \
 		Makefile \
-		tcp_bbrx.c
+		tcp_bbrx.c \
+		bbrx-compat.h
 
 dkms-tarball: $(DKMS_TARBALL)
 

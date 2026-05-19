@@ -603,15 +603,56 @@ kmod_is_loaded() {
   lsmod | grep -qP '\b'"$_module"'\b'
 }
 
+kmod_find_installed() {
+  local _module="$1"
+  local _kver
+
+  _kver="$(uname -r)"
+  find "/lib/modules/$_kver" -name "${_module}.ko" -print -quit 2>/dev/null
+}
+
+dkms_show_build_hint() {
+  local _module="$1"
+  local _log
+
+  error "DKMS may have failed to build $_module for kernel $(uname -r)."
+  for _log in /var/lib/dkms/"$_module"/*/build/make.log; do
+    if [[ -f "$_log" ]]; then
+      note "Last build log: $_log"
+      note "Tail:"
+      tail -n 20 "$_log" | sed 's/^/\t/' >&2
+      return
+    fi
+  done
+  note "Try: dkms status; dkms install $_module/<version> -k $(uname -r)"
+}
+
 kmod_load_if_unloaded() {
   local _module="$1"
+  local _ko _err
 
   if ! kmod_is_loaded "$_module"; then
+    _ko="$(kmod_find_installed "$_module")"
+    if [[ -z "$_ko" ]]; then
+      dkms_show_build_hint "$DKMS_MODULE_NAME"
+      error "No ${_module}.ko found under /lib/modules/$(uname -r)/ — module was not built."
+      return 1
+    fi
     echo -n "Loading kernel module $_module ... "
-    if modprobe "$_module"; then
+    _err="$(mktemp)"
+    if modprobe "$_module" 2>"$_err"; then
       echo "ok"
+      rm -f "$_err"
     else
-      error "Failed to load kernel module, kernel module might not be installed successfully."
+      error "Failed to load kernel module $_module."
+      if [[ -s "$_err" ]]; then
+        note "modprobe: $(tr '\n' ' ' < "$_err")"
+      fi
+      rm -f "$_err"
+      if has_command dmesg; then
+        note "Recent kernel messages:"
+        dmesg 2>/dev/null | tail -n 8 | sed 's/^/\t/' >&2 || true
+      fi
       return 1
     fi
   fi
@@ -822,6 +863,13 @@ perform_install() {
   echo "Rebuilding DKMS modules as needed ... "
   if ! dkms autoinstall; then
     warning "Error occurred in 'dkms autoinstall', please check above output."
+  fi
+
+  if [[ -z "$(kmod_find_installed "$KERNEL_MODULE_NAME")" ]]; then
+    dkms_show_build_hint "$DKMS_MODULE_NAME"
+    error "tcp-bbrx DKMS package is present but ${KERNEL_MODULE_NAME}.ko was not built for $(uname -r)."
+    error "Install linux-headers-$(uname -r), then run: dkms install $DKMS_MODULE_NAME/<version> -k $(uname -r)"
+    exit 2
   fi
 
   kmod_setup_autoload "$KERNEL_MODULE_NAME"
