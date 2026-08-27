@@ -61,8 +61,8 @@ mktemp() {
 }
 
 tput() {
-  if has_command tput; then
-    command tput "$@"
+  if [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] && has_command tput; then
+    command tput "$@" 2>/dev/null || true
   fi
 }
 
@@ -203,6 +203,57 @@ install_software() {
   fi
 }
 
+apt_package_has_candidate() {
+  local _package_name="$1"
+  local _candidate
+
+  _candidate="$(apt-cache policy "$_package_name" 2>/dev/null \
+    | awk '/^[[:space:]]*Candidate:/ { print $2; exit }')"
+  [[ -n "$_candidate" && "$_candidate" != "(none)" ]]
+}
+
+apt_kernel_metapackages() {
+  local _kernel_ver="$1"
+
+  case "$_kernel_ver" in
+    *-cloud-amd64)
+      echo "linux-image-cloud-amd64 linux-headers-cloud-amd64"
+      ;;
+    *-rt-amd64)
+      echo "linux-image-rt-amd64 linux-headers-rt-amd64"
+      ;;
+    *-amd64)
+      echo "linux-image-amd64 linux-headers-amd64"
+      ;;
+    *-cloud-arm64)
+      echo "linux-image-cloud-arm64 linux-headers-cloud-arm64"
+      ;;
+    *-rt-arm64)
+      echo "linux-image-rt-arm64 linux-headers-rt-arm64"
+      ;;
+    *-arm64)
+      echo "linux-image-arm64 linux-headers-arm64"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+latest_kernel_with_headers() {
+  local _module_dir
+  local _latest=""
+
+  for _module_dir in /lib/modules/*; do
+    [[ -d "$_module_dir/build" ]] || continue
+    if [[ -z "$_latest" ]] \
+        || [[ "$(printf '%s\n%s\n' "$_latest" "${_module_dir##*/}" | sort -V | tail -n 1)" != "$_latest" ]]; then
+      _latest="${_module_dir##*/}"
+    fi
+  done
+  echo "$_latest"
+}
+
 install_linux_headers() {
   local _kernel_ver="$(uname -r)"
 
@@ -224,7 +275,55 @@ install_linux_headers() {
     fi
     install_software "$_kernel_pkg-headers"
   elif has_command apt; then
-    install_software "linux-headers-$_kernel_ver"
+    local _exact_headers="linux-headers-$_kernel_ver"
+    local _metapackages _kernel_meta _headers_meta _next_kernel
+
+    if ! detect_package_manager; then
+      error "Supported package manager is not detected, please install $_exact_headers manually."
+      return 65
+    fi
+
+    if apt_package_has_candidate "$_exact_headers"; then
+      install_software "$_exact_headers"
+      return 0
+    fi
+
+    warning "The configured APT repositories do not provide $_exact_headers."
+    warning "The running kernel is likely obsolete or came from a repository that is no longer configured."
+
+    if ! _metapackages="$(apt_kernel_metapackages "$_kernel_ver")"; then
+      error "Cannot determine Debian/Ubuntu kernel metapackages for $_kernel_ver."
+      note "Install matching headers manually, or install a supported kernel and reboot into it."
+      return 65
+    fi
+    read -r _kernel_meta _headers_meta <<< "$_metapackages"
+
+    if ! apt_package_has_candidate "$_kernel_meta" \
+        || ! apt_package_has_candidate "$_headers_meta"; then
+      error "APT has no candidate for $_kernel_meta and/or $_headers_meta."
+      note "Check your Debian/Ubuntu APT sources, then install matching kernel headers manually."
+      return 65
+    fi
+
+    note "Installing the current kernel flavor via metapackages: $_kernel_meta $_headers_meta"
+    if ! $PACKAGE_MANAGEMENT_INSTALL "$_kernel_meta" "$_headers_meta"; then
+      error "Cannot install Debian/Ubuntu kernel metapackages."
+      return 65
+    fi
+
+    if is_linux_headers_installed; then
+      return 0
+    fi
+
+    _next_kernel="$(latest_kernel_with_headers)"
+    error "Headers for the running kernel $_kernel_ver are unavailable."
+    if [[ -n "$_next_kernel" && "$_next_kernel" != "$_kernel_ver" ]]; then
+      note "Kernel $_next_kernel and its headers are installed."
+      note "Reboot into $_next_kernel, then rerun: $(script_name 1) install -f"
+    else
+      note "Reboot into the newly installed kernel, then rerun: $(script_name 1) install -f"
+    fi
+    return 2
   elif has_command dnf || has_command yum; then
     install_software "kernel-devel-$_kernel_ver"
   else
@@ -330,6 +429,7 @@ check_linux_headers() {
     if ! install_linux_headers; then
       warning "Kernel headers is missing for current running kernel."
       warning "The DKMS kernel module will not be compiled."
+      return 2
     fi
   fi
 }
@@ -608,7 +708,12 @@ kmod_find_installed() {
   local _kver
 
   _kver="$(uname -r)"
-  find "/lib/modules/$_kver" -name "${_module}.ko" -print -quit 2>/dev/null
+  find "/lib/modules/$_kver" \
+    \( -name "${_module}.ko" \
+    -o -name "${_module}.ko.xz" \
+    -o -name "${_module}.ko.zst" \
+    -o -name "${_module}.ko.gz" \) \
+    -print -quit 2>/dev/null
 }
 
 dkms_show_build_hint() {
@@ -627,17 +732,43 @@ dkms_show_build_hint() {
   note "Try: dkms status; dkms install $_module/<version> -k $(uname -r)"
 }
 
+kmod_supports_congestion_control() {
+  local _congestion_control="$1"
+  local _available
+
+  _available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  [[ " $_available " == *" $_congestion_control "* ]]
+}
+
+kmod_validate_installed() {
+  local _module="$1"
+  local _ko _vermagic
+
+  _ko="$(kmod_find_installed "$_module")"
+  if [[ -z "$_ko" ]]; then
+    return 1
+  fi
+
+  _vermagic="$(modinfo -F vermagic "$_ko" 2>/dev/null || true)"
+  if [[ -z "$_vermagic" || "${_vermagic%% *}" != "$(uname -r)" ]]; then
+    error "Module $_ko does not match the running kernel $(uname -r)."
+    [[ -n "$_vermagic" ]] && note "Module vermagic: $_vermagic"
+    return 1
+  fi
+}
+
 kmod_load_if_unloaded() {
   local _module="$1"
   local _ko _err
 
+  if ! kmod_validate_installed "$_module"; then
+    dkms_show_build_hint "$DKMS_MODULE_NAME"
+    error "No valid ${_module}.ko was built for $(uname -r)."
+    return 1
+  fi
+
   if ! kmod_is_loaded "$_module"; then
     _ko="$(kmod_find_installed "$_module")"
-    if [[ -z "$_ko" ]]; then
-      dkms_show_build_hint "$DKMS_MODULE_NAME"
-      error "No ${_module}.ko found under /lib/modules/$(uname -r)/ — module was not built."
-      return 1
-    fi
     echo -n "Loading kernel module $_module ... "
     _err="$(mktemp)"
     if modprobe "$_module" 2>"$_err"; then
@@ -656,18 +787,72 @@ kmod_load_if_unloaded() {
       return 1
     fi
   fi
+
+  if ! kmod_is_loaded "$_module"; then
+    error "Module $_module is not present in lsmod after modprobe."
+    return 1
+  fi
+  if ! kmod_supports_congestion_control bbrx; then
+    error "Module $_module loaded, but bbrx is absent from net.ipv4.tcp_available_congestion_control."
+    return 1
+  fi
+}
+
+KMOD_RESTORE_CONGESTION_CONTROL=""
+
+kmod_release_default_congestion_control() {
+  local _module="$1"
+  local _current _fallback
+
+  _current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  [[ "$_module" == "$KERNEL_MODULE_NAME" && "$_current" == "bbrx" ]] || return 0
+
+  for _fallback in cubic reno; do
+    if kmod_supports_congestion_control "$_fallback"; then
+      note "Temporarily switching the default congestion control from bbrx to $_fallback for module reload."
+      if sysctl -q -w "net.ipv4.tcp_congestion_control=$_fallback"; then
+        KMOD_RESTORE_CONGESTION_CONTROL="bbrx"
+        return 0
+      fi
+    fi
+  done
+
+  error "Cannot select a fallback congestion control before unloading $_module."
+  return 1
+}
+
+kmod_restore_default_congestion_control() {
+  if [[ -z "$KMOD_RESTORE_CONGESTION_CONTROL" ]]; then
+    return 0
+  fi
+
+  if ! kmod_supports_congestion_control "$KMOD_RESTORE_CONGESTION_CONTROL"; then
+    error "Cannot restore unavailable congestion control $KMOD_RESTORE_CONGESTION_CONTROL."
+    return 1
+  fi
+  if ! sysctl -q -w "net.ipv4.tcp_congestion_control=$KMOD_RESTORE_CONGESTION_CONTROL"; then
+    error "Cannot restore congestion control $KMOD_RESTORE_CONGESTION_CONTROL."
+    return 1
+  fi
+  note "Restored the default congestion control to $KMOD_RESTORE_CONGESTION_CONTROL."
+  KMOD_RESTORE_CONGESTION_CONTROL=""
 }
 
 kmod_unload_if_loaded() {
   local _module="$1"
 
   if kmod_is_loaded "$_module"; then
+    if ! kmod_release_default_congestion_control "$_module"; then
+      return 1
+    fi
+
     echo -n "Unloading kernel module $_module ... "
     if rmmod "$_module"; then
       echo "ok"
     else
-      error "Failed to unload kernel module, kernel module might be occupied by other process."
-      error "Try to stop all related proxy service, or simply reboot your server and try again."
+      error "Failed to unload kernel module, kernel module might be occupied by active sockets or another process."
+      error "Stop services using bbrx, or reboot the server to activate the updated module."
+      kmod_restore_default_congestion_control || true
       return 1
     fi
   fi
@@ -861,13 +1046,15 @@ perform_install() {
   fi
 
   echo "Rebuilding DKMS modules as needed ... "
-  if ! dkms autoinstall; then
-    warning "Error occurred in 'dkms autoinstall', please check above output."
+  if ! dkms autoinstall -k "$(uname -r)"; then
+    dkms_show_build_hint "$DKMS_MODULE_NAME"
+    error "DKMS failed to build modules for $(uname -r)."
+    exit 2
   fi
 
-  if [[ -z "$(kmod_find_installed "$KERNEL_MODULE_NAME")" ]]; then
+  if ! kmod_validate_installed "$KERNEL_MODULE_NAME"; then
     dkms_show_build_hint "$DKMS_MODULE_NAME"
-    error "tcp-bbrx DKMS package is present but ${KERNEL_MODULE_NAME}.ko was not built for $(uname -r)."
+    error "tcp-bbrx DKMS package is present but a valid ${KERNEL_MODULE_NAME}.ko was not built for $(uname -r)."
     error "Install linux-headers-$(uname -r), then run: dkms install $DKMS_MODULE_NAME/<version> -k $(uname -r)"
     exit 2
   fi
@@ -876,7 +1063,8 @@ perform_install() {
 
   if [[ -z "$_install_needed" ]]; then
     if ! kmod_load_if_unloaded "$KERNEL_MODULE_NAME"; then
-      warning "tcp-bbrx is installed but failed to load."
+      error "tcp-bbrx is installed but failed validation or loading."
+      exit 2
     fi
 
     echo "${tbold}There is nothing to do today.${treset}"
@@ -892,6 +1080,13 @@ perform_install() {
     error "tcp-bbrx is successfully installed, but failed to load, this might cause by mismatched linux-headers."
     error "If you update your system recently, reboot the system might solve this."
     exit 2
+  fi
+  if ! kmod_restore_default_congestion_control; then
+    exit 2
+  fi
+
+  if [[ -z "$_version" ]]; then
+    _version="$(dkms_get_installed_versions "$DKMS_MODULE_NAME" | head -1)"
   fi
 
   echo
@@ -971,6 +1166,7 @@ perform_reload() {
 
   kmod_unload_if_loaded "$KERNEL_MODULE_NAME"
   kmod_load_if_unloaded "$KERNEL_MODULE_NAME"
+  kmod_restore_default_congestion_control
 }
 
 perform_unload() {
@@ -1020,6 +1216,8 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
 
 # vim:set ft=bash ts=2 sw=2 sts=2 et:
